@@ -35,7 +35,7 @@ class Actor(DQN):
     def __init__(self, input_dim, output_dim, hidden1_dim=256, hidden2_dim=512):
         super(Actor, self).__init__(input_dim, output_dim, hidden1_dim, hidden2_dim)
 
-    def forward(self, x):
+    def forward(self, x, state_trajs=None, action_trajs=None, ts_trajs=None, train=False):
         return torch.tanh(super().forward(x))
 
 
@@ -45,8 +45,29 @@ class Critic(DQN):
         super(Critic, self).__init__(input_dim, output_dim, hidden1_dim, hidden2_dim)
         self.fc2 = nn.Linear(hidden1_dim + action_dim, hidden2_dim)
 
-    def forward(self, x, a=None):
+    def forward(self, x, a=None, state_trajs=None, action_trajs=None, ts_trajs=None, train=False):
         assert a is not None
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(torch.cat((x, a), dim=-1)))
         return self.fc3(x)
+
+
+class PolicyBase:
+    def __init__(self, state_dim, action_dim, device, gamma=0.99, latent=False):
+        self.device = device
+        self.num_states = state_dim
+        self.num_actions = action_dim
+        self.gamma = gamma
+        self.latent = latent
+
+    def __repr__(self):
+        return "Base"
+
+    def select_action(self, state, eps=None):
+        raise NotImplementedError
+
+    def optimize(self, memory, Transition, rms=None):
+        pass
+
+    def update_target_policy(self):
+        pass

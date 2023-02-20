@@ -1,5 +1,5 @@
-from policy import PolicyBase, Critic, soft_update
-from model import ModelFreeODE, MLP
+from policy import PolicyBase, soft_update, Actor, Critic
+from model import ActorODE, CriticODE
 import replay_memory
 import torch
 import torch.optim as optim
@@ -19,8 +19,9 @@ critic: (s, a) from 0 to T --[ODE]--> h_{T+1} -[Linear]-> V(s_{T+1})
 
 class Policy_ODE_DDPG(PolicyBase):
     def __init__(self, state_dim, action_dim, device, actor_lr=0.0001, critic_lr=0.001,
-        batch_size=128, gamma=0.99, target_update=0.001, policy_model:ModelFreeODE=None,
-        target_model:ModelFreeODE=None, func_encode_action=lambda x: x):
+        batch_size=128, gamma=0.99, target_update=0.001, policy_actor:ActorODE=None,
+        policy_critic:CriticODE=None, target_actor:ActorODE=None, target_critic:CriticODE=None,
+        func_encode_action=lambda x: x):
          # conf
         super(Policy_ODE_DDPG, self).__init__(state_dim, action_dim, device, gamma=gamma, latent=False)
         self.batch_size = batch_size
@@ -29,13 +30,18 @@ class Policy_ODE_DDPG(PolicyBase):
                                                                dtype=torch.float, device=self.device)
         self.input_dim = self.num_actions + self.num_actions
         # model
-        self.policy_ode_model = policy_model
-        self.target_ode_model = target_model
-        # load model states
-        self.target_ode_model.load_state_dict(self.policy_ode_model.state_dict())
-        self.target_ode_model.eval()
+        self.policy_actor = policy_actor
+        self.policy_critic = policy_critic
+        self.target_actor = target_actor
+        self.target_critic = target_critic
+        # load model states, set to eval mode
+        self.target_critic.load_state_dict(self.policy_critic.state_dict())
+        self.target_actor.load_state_dict(self.policy_actor.state_dict())
+        self.target_actor.eval()
+        self.target_critic.eval()
         # optimizer
-        self.optimizer = optim.Adam(self.policy_ode_model.parameters(), lr=actor_lr)
+        self.optimizer_actor = optim.Adam(self.policy_actor.parameters(), lr=actor_lr)
+        self.optimizer_critic = optim.Adam(self.policy_critic.parameters(), lr=critic_lr)
         self.criterion = nn.MSELoss()
 
     def __repr__(self):
@@ -61,22 +67,23 @@ class Policy_ODE_DDPG(PolicyBase):
         if eps is not None and np.random.uniform() < eps:
             action = np.random.uniform(-1, 1, size=self.num_actions)
         else:
-            action = self.policy_ode_model.compute_action(
-                state, state_traj, action_traj, ts_traj).cpu().numpy()
-            print(action)
+            with torch.no_grad():
+                action = self.policy_actor(
+                    state, state_traj, action_traj, ts_traj, train=False).detach().cpu().numpy()
             action += self.noise
             action = np.clip(action, -1, 1)
         return action
 
     def select_action_in_batch(self, states, state_trajs, action_trajs, ts_trajs, noise=True):
-        actions = self.policy_ode.compute_action(states, state_trajs, action_trajs, ts_trajs)
+        with torch.no_grad():
+            actions = self.policy_actor(states, state_trajs, action_trajs, ts_trajs, train=False)
         if noise:
             actions += torch.empty_like(actions, dtype=torch.float, device=self.device).normal_(0, 0.1)
         actions = torch.clamp(actions, -1, 1)
         return actions
 
     def calc_value_in_batch(self, states, actions, state_trajs, action_trajs, ts_trajs):
-        return self.policy_ode_model.compute_value(
+        return self.policy_critic(
             states, actions, state_trajs, action_trajs, ts_trajs
         ).squeeze(-1)
 
@@ -124,18 +131,18 @@ class Policy_ODE_DDPG(PolicyBase):
         assert len(reward_batch.size()) == 1
 
         # compute Q(s_t, a)
-        state_action_values = self.policy_ode_model.compute_value(state_batch, action_batch,
+        state_action_values = self.policy_critic(state_batch, action_batch,
             state_traj_batch, action_traj_batch, ts_traj_batch, train=True).squeeze(1)
 
         # compute max_a Q(s_{t+1}, a) for all next states
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         # 1. compute a(s_{t+1})
-        next_action_batch = self.target_ode_model.compute_action(
+        next_action_batch = self.target_actor(
             non_final_next_state_batch, non_final_next_state_traj_batch, 
             non_final_next_action_traj_batch, non_final_next_ts_traj_batch, train=True
         ).detach()
         # 2. compute Q(s_{t+1}, a_(s_{t+1}))
-        qvals = self.target_ode_model.compute_value(
+        qvals = self.target_critic(
             non_final_next_state_batch, next_action_batch, non_final_next_state_traj_batch, 
             non_final_next_action_traj_batch, non_final_next_ts_traj_batch, train=True
         ).squeeze(1).detach()
@@ -145,34 +152,31 @@ class Policy_ODE_DDPG(PolicyBase):
         expected_state_action_values = reward_batch + (self.gamma ** dt_batch) * next_state_values
 
         # compute critic loss
-        # print("state diff:", state_action_values, expected_state_action_values)
         critic_loss = self.criterion(state_action_values, expected_state_action_values)
-        # print("critic loss:", critic_loss)
 
         # optimize the critic
-        self.optimizer.zero_grad()
+        self.optimizer_critic.zero_grad()
         critic_loss.backward()
-        self.optimizer.step()
+        self.optimizer_critic.step()
 
         # compute actor loss
-        a_temp = self.policy_ode_model.compute_action(state_batch, state_traj_batch, 
+        a_temp = self.policy_actor(state_batch, state_traj_batch, 
             action_traj_batch, ts_traj_batch, train=True)
-        actor_loss = -self.policy_ode_model.compute_value(state_batch, a_temp, state_traj_batch, 
+        actor_loss = -self.policy_critic(state_batch, a_temp, state_traj_batch, 
             action_traj_batch, ts_traj_batch, train=True).mean()
 
         # optimize the actor
-        self.optimizer.zero_grad()
+        self.optimizer_actor.zero_grad()
         actor_loss.backward()
-        self.optimizer.step()
+        self.optimizer_actor.step()
 
         # update target
-        soft_update(self.target_ode_model, self.policy_ode_model, self.target_update)
+        soft_update(self.target_actor, self.policy_actor, self.target_update)
+        soft_update(self.target_critic, self.policy_critic, self.target_update)
         # print("loss:", actor_loss, critic_loss)
         return critic_loss.item(), actor_loss.item()
-
 
 
     @property
     def noise(self):
         return np.random.normal(0, 0.1, size=self.num_actions)
-

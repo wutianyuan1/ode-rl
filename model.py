@@ -169,6 +169,10 @@ class BaseVAEModel(nn.Module):
             @:return shape [N, T, D_state]
         """
         return self.decoder(zs)
+    
+    def sample_init_latent_states(self, num_trajs=0):
+        shape = (self.latent_dim,) if num_trajs == 0 else (num_trajs, self.latent_dim)
+        return self.z0_prior.sample(sample_shape=shape).squeeze(-1)
 
 
 class LatentODE(BaseVAEModel):
@@ -207,48 +211,23 @@ class LatentODE(BaseVAEModel):
         assert new_latent_state.size(1) == self.latent_dim
         return new_latent_state
 
-    def rollout_timeline(self, data, latent_state, dts):
-        aug_latent_state = self.aug_layer(torch.cat((data, latent_state), dim=-1))
-        traj_latent_state = self.diffeq_solver(aug_latent_state, dts)
-        return traj_latent_state  # [1, T, D]
 
-
-class ModelFreeODE(LatentODE):
+class ActorODE(LatentODE):
     def __init__(self, state_dim, action_dim, input_dim, latent_dim, eps_decay,
-                 encoder_z0, decoder, diffeq_solver, z0_prior, device,
-                 actor_use_ode=True, critic_use_ode=True):
+                 encoder_z0, decoder, diffeq_solver, z0_prior, device, use_ode=True):
         super().__init__(
             input_dim, latent_dim, eps_decay, encoder_z0,
             decoder, diffeq_solver, None, z0_prior, device)
         self.num_states = state_dim
         self.num_actions = action_dim
-        a_input_dim, c_input_dim = self.num_states, self.num_states
-        self.actor_use_ode = actor_use_ode
-        self.critic_use_ode = critic_use_ode
-        if actor_use_ode:
-            a_input_dim = self.latent_dim + self.num_states
-        if critic_use_ode:
-            c_input_dim = self.latent_dim + self.num_states
+        self.use_ode = use_ode
+        a_input_dim = self.num_states
+        if use_ode:
+            a_input_dim += self.latent_dim
         self.actor_mlp = Actor(a_input_dim, self.num_actions,
             hidden1_dim=64, hidden2_dim=64).to(self.device)
-        self.critic_mlp = Critic(c_input_dim, 1, self.num_actions,
-            hidden1_dim=64, hidden2_dim=64).to(self.device)
-    
-    def compute_loss(self, states, actions, time_steps, lengths, dt_coef=.01, kl_coef=1., train=True):
-        print("This function should not be called")
-        return NotImplementedError
-    
-    def compute_hidden(self, state_trajs, action_trajs, ts_trajs, lengths, train):
-        h, _, _ = self.encode_latent_traj(
-                    state_trajs,    # [N, len, D_state]
-                    action_trajs,   # [N, len, D_action]
-                    ts_trajs,       # [N, len]
-                    lengths,        # [N, ]
-                    train           # train
-                )
-        return h
 
-    def compute_action(self, states, state_trajs, action_trajs, ts_trajs, train=False):
+    def forward(self, states, state_trajs, action_trajs, ts_trajs, train):
         '''
         This is to select action for inference/rollout in batch (batchsize=N)
             states:         [N, D_state]
@@ -258,15 +237,6 @@ class ModelFreeODE(LatentODE):
         Returns:
             actions:        [N, D_action]
         '''
-        if not self.actor_use_ode:
-            if len(states.shape) == 1:
-                states = states.unsqueeze(0)
-            if train:
-                return self.actor_mlp(states)
-            else:
-                with torch.no_grad():
-                    return self.actor_mlp(states)
-
         lengths = torch.fill(
             torch.zeros(state_trajs.size(0)), state_trajs.size(1)
         ).to(self.device)
@@ -277,17 +247,33 @@ class ModelFreeODE(LatentODE):
             action_trajs = action_trajs.unsqueeze(0)
             ts_trajs = ts_trajs.unsqueeze(0)
 
-        if train:
-            h = self.compute_hidden(state_trajs, action_trajs, ts_trajs, lengths, True)
-            states = torch.cat([states, h], dim=-1)
-            return self.actor_mlp(states)
-        else:
-            with torch.no_grad():
-                h = self.compute_hidden(state_trajs, action_trajs, ts_trajs, lengths, False)
-                states = torch.cat([states, h], dim=-1)
-                return self.actor_mlp(states)
+        h, _, _ = self.encode_latent_traj(
+                    state_trajs,    # [N, len, D_state]
+                    action_trajs,   # [N, len, D_action]
+                    ts_trajs,       # [N, len]
+                    lengths,        # [N, ]
+                    train           # train
+                )
+        states = torch.cat([states, h], dim=-1)
+        return self.actor_mlp(states)
 
-    def compute_value(self, states, actions, state_trajs, action_trajs, ts_trajs, train=False):
+
+class CriticODE(LatentODE):
+    def __init__(self, state_dim, action_dim, input_dim, latent_dim, eps_decay,
+                 encoder_z0, decoder, diffeq_solver, z0_prior, device, use_ode=True):
+        super().__init__(
+            input_dim, latent_dim, eps_decay, encoder_z0,
+            decoder, diffeq_solver, None, z0_prior, device)
+        self.num_states = state_dim
+        self.num_actions = action_dim
+        self.use_ode = use_ode
+        c_input_dim = self.num_states
+        if use_ode:
+            c_input_dim += self.latent_dim
+        self.critic_mlp = Critic(c_input_dim, 1, self.num_actions,
+            hidden1_dim=64, hidden2_dim=64).to(self.device)
+
+    def forward(self, states, actions, state_trajs, action_trajs, ts_trajs, train):
         '''
         This is to compute Q(s,a) for inference/rollout in batch (batchsize=N)
             states:         [N, D_state]
@@ -298,24 +284,15 @@ class ModelFreeODE(LatentODE):
         Returns:
             values Q(s,a):  [N, ]
         '''
-        if not self.critic_use_ode:
-            if train:
-                return self.critic_mlp(states, actions)
-            else:
-                with torch.no_grad():
-                    return self.critic_mlp(states, actions)
-
         lengths = torch.fill(
             torch.zeros(state_trajs.size(0)), state_trajs.size(1)
         ).to(self.device)
-
-        if train:
-            h = self.compute_hidden(state_trajs, action_trajs, ts_trajs, lengths, True)
-            states = torch.cat([states, h], dim=-1)
-            q_values = self.critic_mlp(states, actions)
-        else:
-            with torch.no_grad():
-                h = self.compute_hidden(state_trajs, action_trajs, ts_trajs, lengths, False)
-                states = torch.cat([states, h], dim=-1)
-                q_values = self.critic_mlp(states, actions)
-        return q_values
+        h, _, _ = self.encode_latent_traj(
+                    state_trajs,    # [N, len, D_state]
+                    action_trajs,   # [N, len, D_action]
+                    ts_trajs,       # [N, len]
+                    lengths,        # [N, ]
+                    train           # train
+                )
+        states = torch.cat([states, h], dim=-1)
+        return self.critic_mlp(states, actions)

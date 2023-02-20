@@ -5,9 +5,9 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 import torch.optim as optim
 from ddpg_ode import Policy_ODE_DDPG
-from policy import PolicyDDPG
 from envs.half_cheetah_simulator import HalfCheetahSimulator
-from model import Encoder_z0_RNN, Decoder, DiffeqSolver, ODEFunc, ModelFreeODE
+from model import Encoder_z0_RNN, DiffeqSolver, ODEFunc, ActorODE, CriticODE
+from policy import Actor, Critic
 from replay_memory import ReplayMemory, Transition
 from running_stats import RunningStats
 from tqdm import trange
@@ -30,8 +30,45 @@ class ModelFreeODERL(object):
         self.logger = logger
         self.rms = RunningStats(dim=self.simulator.num_states, device=self.device) if obs_normal else None
         self.seed = seed
+        self.actor_use_ode = actor_use_ode
+        self.critic_use_ode = critic_use_ode
 
-         # ode network   
+        self.policy_actor = self.create_actor_critic("actor", self.actor_use_ode, latent_dim, 
+            enc_hidden_to_latent_dim, eps_decay, ode_dim, ode_tol)
+        self.policy_critic = self.create_actor_critic("critic", self.critic_use_ode, latent_dim, 
+            enc_hidden_to_latent_dim, eps_decay, ode_dim, ode_tol)
+        self.target_actor = self.create_actor_critic("actor", self.actor_use_ode, latent_dim, 
+            enc_hidden_to_latent_dim, eps_decay, ode_dim, ode_tol)
+        self.target_critic = self.create_actor_critic("critic", self.critic_use_ode, latent_dim, 
+            enc_hidden_to_latent_dim, eps_decay, ode_dim, ode_tol)
+        print(self.policy_actor, self.policy_critic, self.target_actor, self.target_critic)
+
+        # policy and replay buffer
+        self.policy = Policy_ODE_DDPG(
+            state_dim=self.simulator.num_states, action_dim=self.simulator.num_actions,
+            device=self.device, gamma=gamma,
+            batch_size=batch_size,
+            policy_actor=self.policy_actor, policy_critic=self.policy_critic,
+            target_actor=self.target_actor, target_critic=self.target_critic
+        )
+
+        self.memory_trans = ReplayMemory(mem_size, Transition)
+
+        if trained_model_path:
+            self.model.load_state_dict(torch.load(trained_model_path, map_location=self.device)['model_state_dict'])
+            self.target_model.load_state_dict(torch.load(trained_model_path, map_location=self.device)['model_state_dict'])
+
+
+    def create_actor_critic(self, ac_type, use_ode, latent_dim, enc_hidden_to_latent_dim, eps_decay, ode_dim, ode_tol):
+        if not use_ode:
+            if ac_type == 'actor':
+                return Actor(self.simulator.num_states, self.simulator.num_actions,
+                             hidden1_dim=64, hidden2_dim=64).to(self.device)
+            else:
+                return Critic(self.simulator.num_states, 1, self.simulator.num_actions,
+                              hidden1_dim=64, hidden2_dim=64).to(self.device)
+
+        # ode network   
         gen_ode_func = ODEFunc(ode_func_net=utils.create_net(latent_dim, latent_dim, n_layers=2, n_units=ode_dim,
                                                                 nonlinear=nn.Tanh)).to(self.device)
         diffq_solver = DiffeqSolver(gen_ode_func, 'dopri5', odeint_rtol=ode_tol, odeint_atol=ode_tol/10)
@@ -39,48 +76,33 @@ class ModelFreeODERL(object):
         encoder = Encoder_z0_RNN(latent_dim, self.input_dim, hidden_to_z0_units=enc_hidden_to_latent_dim,
                                     device=self.device).to(self.device)
         z0_prior = Normal(torch.tensor([0.]).to(self.device), torch.tensor([1.]).to(self.device))
-
-        # decoder
-        decoder = Decoder(latent_dim, self.output_dim, n_layers=0).to(self.device)
-        self.model = ModelFreeODE(
-            state_dim=self.simulator.num_states,
-            action_dim=self.simulator.num_actions,
-            input_dim=self.input_dim,
-            latent_dim=latent_dim,
-            eps_decay=eps_decay,
-            encoder_z0=encoder,
-            decoder=decoder,
-            diffeq_solver=diffq_solver,
-            z0_prior=z0_prior,
-            actor_use_ode=actor_use_ode,
-            critic_use_ode=critic_use_ode,
-            device=self.device).to(self.device)
-        self.target_model = ModelFreeODE(
-            state_dim=self.simulator.num_states,
-            action_dim=self.simulator.num_actions,
-            input_dim=self.input_dim,
-            latent_dim=latent_dim,
-            eps_decay=eps_decay,
-            encoder_z0=encoder,
-            decoder=decoder,
-            diffeq_solver=diffq_solver,
-            z0_prior=z0_prior,
-            actor_use_ode=actor_use_ode,
-            critic_use_ode=critic_use_ode,
-            device=self.device).to(self.device)
-        # policy and replay buffer
-        self.policy = Policy_ODE_DDPG(
-        # self.policy = PolicyDDPG(
-            state_dim=self.simulator.num_states, action_dim=self.simulator.num_actions,
-            device=self.device, gamma=gamma,
-            batch_size=batch_size,
-            policy_model=self.model, target_model=self.target_model
-        )
-        self.memory_trans = ReplayMemory(mem_size, Transition)
-
-        if trained_model_path:
-            self.model.load_state_dict(torch.load(trained_model_path, map_location=self.device)['model_state_dict'])
-            self.target_model.load_state_dict(torch.load(trained_model_path, map_location=self.device)['model_state_dict'])
+        if ac_type == 'actor':
+            return ActorODE(
+                state_dim=self.simulator.num_states,
+                action_dim=self.simulator.num_actions,
+                input_dim=self.input_dim,
+                latent_dim=latent_dim,
+                eps_decay=eps_decay,
+                encoder_z0=encoder,
+                decoder=None,
+                diffeq_solver=diffq_solver,
+                z0_prior=z0_prior,
+                device=self.device,
+                use_ode=use_ode).to(self.device)
+        else:
+            return CriticODE(
+                state_dim=self.simulator.num_states,
+                action_dim=self.simulator.num_actions,
+                input_dim=self.input_dim,
+                latent_dim=self.latent_dim,
+                eps_decay=eps_decay,
+                encoder_z0=encoder,
+                decoder=None,
+                diffeq_solver=diffq_solver,
+                z0_prior=z0_prior,
+                device=self.device,
+                use_ode=use_ode
+            ).to(self.device)
 
 
     def run_policy(self, max_steps, eps=None, store_trans=True):
@@ -104,7 +126,8 @@ class ModelFreeODERL(object):
             norm_state = state if self.rms is None else self.rms.normalize(state)
             action = self.policy.select_action(norm_state, state_traj=state_traj[i_step-history_len:i_step], 
                 action_traj=action_traj[i_step-history_len:i_step], ts_traj=ts_traj[i_step-history_len:i_step+1], eps=eps)
-            action = action[0]
+            if self.actor_use_ode:
+                action = action[0]
             action_encoded = torch.tensor(action, device=self.device).unsqueeze(0)
             dt = self.simulator.get_time_gap(action=action)
             next_state, reward, done, info = self.simulator.step(action, dt=dt)
@@ -127,7 +150,7 @@ class ModelFreeODERL(object):
             if done:
                 break
 
-            if i_step % 16 == 0:
+            if i_step % 1 == 0:
                 self.policy.optimize(self.memory_trans, Transition, self.rms)
 
         # calculate accumulated rewards
