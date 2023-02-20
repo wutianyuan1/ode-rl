@@ -1,0 +1,11 @@
+*.txt
+*.log
+*.pth
+*.ckpt
+*.pyc
+__pycache__/
+*.png
+*.jpg
+models/
+logs/
+results/
