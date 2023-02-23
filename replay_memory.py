@@ -5,7 +5,7 @@ from collections import namedtuple
 Transition = namedtuple('Transition',
                         ('state', 'next_state', 'action', 'reward', 'dt', 'state_traj', 'action_traj', 'ts_traj'))
 
-Trajectory = namedtuple('Trajectory', ('state_traj', 'action_traj', 'next_state', 'final_reward', 'time_traj', 'length'))
+Trajectory = namedtuple('Trajectory', ('states', 'actions', 'time_steps', 'rewards', 'actor_hiddens', 'critic_hiddens', 'length'))
 
 
 class SumTree(object):

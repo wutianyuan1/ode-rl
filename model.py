@@ -160,7 +160,7 @@ class BaseVAEModel(nn.Module):
             data = torch.cat((states[:, i, :], actions[:, i, :]), dim=-1)  # [N, D_state+D_action]
             zs.append(self.encode_next_latent_state(data, zs[-1], time_steps[:, i + 1] - time_steps[:, i]))
 
-        return zs[-1], means_z0, stds_z0
+        return zs, means_z0, stds_z0
 
     def decode_latent_traj(self, zs):
         """
@@ -227,34 +227,10 @@ class ActorODE(LatentODE):
         self.actor_mlp = Actor(a_input_dim, self.num_actions,
             hidden1_dim=64, hidden2_dim=64).to(self.device)
 
-    def forward(self, states, state_trajs, action_trajs, ts_trajs, train):
-        '''
-        This is to select action for inference/rollout in batch (batchsize=N)
-            states:         [N, D_state]
-            state_trajs:    [N, len, D_state]
-            action_trajs:   [N, len, D_action]
-            ts_trajs:       [N, len+1]
-        Returns:
-            actions:        [N, D_action]
-        '''
-        lengths = torch.fill(
-            torch.zeros(state_trajs.size(0)), state_trajs.size(1)
-        ).to(self.device)
-
-        if len(state_trajs.shape) == 2:
+    def forward(self, states, cur_hidden):
+        if len(states.shape) == 1:
             states = states.unsqueeze(0)
-            state_trajs = state_trajs.unsqueeze(0)
-            action_trajs = action_trajs.unsqueeze(0)
-            ts_trajs = ts_trajs.unsqueeze(0)
-
-        h, _, _ = self.encode_latent_traj(
-                    state_trajs,    # [N, len, D_state]
-                    action_trajs,   # [N, len, D_action]
-                    ts_trajs,       # [N, len]
-                    lengths,        # [N, ]
-                    train           # train
-                )
-        states = torch.cat([states, h], dim=-1)
+        states = torch.cat([states, cur_hidden], dim=-1)
         return self.actor_mlp(states)
 
 
@@ -273,26 +249,6 @@ class CriticODE(LatentODE):
         self.critic_mlp = Critic(c_input_dim, 1, self.num_actions,
             hidden1_dim=64, hidden2_dim=64).to(self.device)
 
-    def forward(self, states, actions, state_trajs, action_trajs, ts_trajs, train):
-        '''
-        This is to compute Q(s,a) for inference/rollout in batch (batchsize=N)
-            states:         [N, D_state]
-            actions:        [N, D_action]
-            state_trajs:    [N, len, D_state]
-            action_trajs:   [N, len, D_action]
-            ts_trajs:       [N, len+1]
-        Returns:
-            values Q(s,a):  [N, ]
-        '''
-        lengths = torch.fill(
-            torch.zeros(state_trajs.size(0)), state_trajs.size(1)
-        ).to(self.device)
-        h, _, _ = self.encode_latent_traj(
-                    state_trajs,    # [N, len, D_state]
-                    action_trajs,   # [N, len, D_action]
-                    ts_trajs,       # [N, len]
-                    lengths,        # [N, ]
-                    train           # train
-                )
-        states = torch.cat([states, h], dim=-1)
+    def forward(self, states, actions, cur_hidden):
+        states = torch.cat([states, cur_hidden], dim=-1)
         return self.critic_mlp(states, actions)
