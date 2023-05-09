@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from envs.make_env import make_env
 from torch.utils.tensorboard import SummaryWriter
-from ode_model import NerualCDEDQN, MLPDQN
+from models.cde_model import NerualCDEDQN, MLPDQN
 from tianshou.data import Collector, PrioritizedVectorReplayBuffer
 from tianshou.policy import DQNPolicy
 from tianshou.trainer import offpolicy_trainer

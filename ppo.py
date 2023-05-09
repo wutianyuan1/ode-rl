@@ -1,273 +1,177 @@
-#!/usr/bin/env python3
-
-import argparse
-import datetime
-import os
-import pprint
-import yaml
-import sys
+from typing import Any, Dict, List, Optional, Type
 
 import numpy as np
 import torch
-from envs.make_env import make_env
 from torch import nn
-from torch.distributions import Independent, Normal
-from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.tensorboard import SummaryWriter
+import time
 
-from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
-from tianshou.trainer import onpolicy_trainer
-from tianshou.utils import TensorboardLogger, WandbLogger
-from tianshou.utils.net.common import Net
-from tianshou.utils.net.continuous import ActorProb, Critic
-from model import RecurrentActorProb, RecurrentCritic
-from ode_model import NeuralCDEActorProb, NeuralCDECritic, MLPActor
-from policy import PPOPolicy
+from tianshou.data import Batch, ReplayBuffer, to_torch_as
+from tianshou.policy import A2CPolicy
+from tianshou.utils.net.common import ActorCritic
 
-class Runner(object):
-    @staticmethod
-    def dist(*logits):
-        loc, scale = logits
-        return Independent(Normal(*logits), 1)
 
-    def __init__(self, config_path) -> None:
-        self.config_path = config_path
-        with open(self.config_path, 'r') as f:
-            conf = yaml.safe_load(f)
-        # Add config attributes to self
-        for key, value in conf.items():
-            self.__dict__[key] = value
-        print(self.__dict__)
-        self.conf = conf
-        self.env, self.train_envs, self.test_envs = self.construct_env()
-        self.actor, self.critic = self.construct_net(self.net_type)
-        self.initialize_params()
-        self.policy = PPOPolicy(
-            self.actor,
-            self.critic,
-            self.optim,
-            self.dist,
-            state_with_time=self.state_with_time,
-            discount_factor=self.gamma,
-            gae_lambda=self.gae_lambda,
-            max_grad_norm=self.max_grad_norm,
-            vf_coef=self.vf_coef,
-            ent_coef=self.ent_coef,
-            reward_normalization=self.rew_norm,
-            action_scaling=True,
-            action_bound_method=self.bound_action_method,
-            lr_scheduler=self.lr_scheduler,
-            action_space=self.env.action_space,
-            eps_clip=self.eps_clip,
-            value_clip=self.value_clip,
-            dual_clip=self.dual_clip,
-            advantage_normalization=self.norm_adv,
-            recompute_advantage=self.recompute_adv,
-        )
-        self.resume()
-        self.train_collector, self.test_collector = self.construct_collecter(
-            stack_num=1 if self.net_type == 'MLP' else self.history_len)
-        self.construct_logger()
-        
-    def construct_net(self, net_type):
-        if net_type == 'MLP':
-            net_a = Net(
-                self.state_shape,
-                hidden_sizes=self.hidden_sizes,
-                activation=nn.Tanh,
-                device=self.device,
-            )
-            actor = ActorProb(
-                net_a,
-                self.action_shape,
-                max_action=self.max_action,
-                unbounded=True,
-                device=self.device,
-            ).to(self.device)
-            net_c = Net(
-                self.state_shape,
-                hidden_sizes=self.hidden_sizes,
-                activation=nn.Tanh,
-                device=self.device,
-            )
-            critic = Critic(net_c, device=self.device).to(self.device)
-        elif net_type == 'RNN':
-            actor = RecurrentActorProb(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
-                max_action=self.max_action,
-                device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                unbounded=True,
-            ).to(self.device)
-            critic = RecurrentCritic(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
-                device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                target='v'
-            ).to(self.device)
-        elif net_type == 'CDE':
-            if not self.both_ode:
-                net_a = Net(
-                    self.state_shape,
-                    hidden_sizes=self.hidden_sizes,
-                    activation=nn.Tanh,
-                    device=self.device,
-                )
-                actor = MLPActor(
-                    net_a,
-                    self.action_shape,
-                    max_action=self.max_action,
-                    unbounded=True,
-                    device=self.device,
-                ).to(self.device)
+class PPOPolicy(A2CPolicy):
+    r"""Implementation of Proximal Policy Optimization. arXiv:1707.06347.
+
+    :param torch.nn.Module actor: the actor network following the rules in
+        :class:`~tianshou.policy.BasePolicy`. (s -> logits)
+    :param torch.nn.Module critic: the critic network. (s -> V(s))
+    :param torch.optim.Optimizer optim: the optimizer for actor and critic network.
+    :param dist_fn: distribution class for computing the action.
+    :type dist_fn: Type[torch.distributions.Distribution]
+    :param float discount_factor: in [0, 1]. Default to 0.99.
+    :param float eps_clip: :math:`\epsilon` in :math:`L_{CLIP}` in the original
+        paper. Default to 0.2.
+    :param float dual_clip: a parameter c mentioned in arXiv:1912.09729 Equ. 5,
+        where c > 1 is a constant indicating the lower bound.
+        Default to 5.0 (set None if you do not want to use it).
+    :param bool value_clip: a parameter mentioned in arXiv:1811.02553v3 Sec. 4.1.
+        Default to True.
+    :param bool advantage_normalization: whether to do per mini-batch advantage
+        normalization. Default to True.
+    :param bool recompute_advantage: whether to recompute advantage every update
+        repeat according to https://arxiv.org/pdf/2006.05990.pdf Sec. 3.5.
+        Default to False.
+    :param float vf_coef: weight for value loss. Default to 0.5.
+    :param float ent_coef: weight for entropy loss. Default to 0.01.
+    :param float max_grad_norm: clipping gradients in back propagation. Default to
+        None.
+    :param float gae_lambda: in [0, 1], param for Generalized Advantage Estimation.
+        Default to 0.95.
+    :param bool reward_normalization: normalize estimated values to have std close
+        to 1, also normalize the advantage to Normal(0, 1). Default to False.
+    :param int max_batchsize: the maximum size of the batch when computing GAE,
+        depends on the size of available memory and the memory cost of the model;
+        should be as large as possible within the memory constraint. Default to 256.
+    :param bool action_scaling: whether to map actions from range [-1, 1] to range
+        [action_spaces.low, action_spaces.high]. Default to True.
+    :param str action_bound_method: method to bound action to range [-1, 1], can be
+        either "clip" (for simply clipping the action), "tanh" (for applying tanh
+        squashing) for now, or empty string for no bounding. Default to "clip".
+    :param Optional[gym.Space] action_space: env's action space, mandatory if you want
+        to use option "action_scaling" or "action_bound_method". Default to None.
+    :param lr_scheduler: a learning rate scheduler that adjusts the learning rate in
+        optimizer in each policy.update(). Default to None (no lr_scheduler).
+    :param bool deterministic_eval: whether to use deterministic action instead of
+        stochastic action sampled by the policy. Default to False.
+
+    .. seealso::
+
+        Please refer to :class:`~tianshou.policy.BasePolicy` for more detailed
+        explanation.
+    """
+
+    def __init__(
+        self,
+        actor: torch.nn.Module,
+        critic: torch.nn.Module,
+        optim: torch.optim.Optimizer,
+        dist_fn: Type[torch.distributions.Distribution],
+        eps_clip: float = 0.2,
+        dual_clip: Optional[float] = None,
+        value_clip: bool = False,
+        advantage_normalization: bool = True,
+        recompute_advantage: bool = False,
+        state_with_time: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(actor, critic, optim, dist_fn, **kwargs)
+        self._eps_clip = eps_clip
+        assert dual_clip is None or dual_clip > 1.0, \
+            "Dual-clip PPO parameter should greater than 1.0."
+        self._dual_clip = dual_clip
+        self._value_clip = value_clip
+        self._norm_adv = advantage_normalization
+        self._recompute_adv = recompute_advantage
+        self._actor_critic: ActorCritic
+        self._state_with_time = state_with_time
+        print(self._state_with_time)
+
+    def process_fn(
+        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
+    ) -> Batch:
+        if self._recompute_adv:
+            # buffer input `buffer` and `indices` to be used in `learn()`.
+            self._buffer, self._indices = buffer, indices
+        '''Calculate time steps'''
+        if self._state_with_time:
+            # for RNN or ODEs: (batchsize, len, obs_dims)
+            if len(batch.obs.shape) == 3:
+                t_curr = batch.obs[:, -1, 0]
+                t_next = batch.obs_next[:, -1, 0]
+            # for MLPs: (batchsize, obs_dims)
             else:
-                actor = NeuralCDEActorProb(
-                    layer_num=3,
-                    state_shape=self.state_shape,
-                    action_shape=self.action_shape,
-                    max_action=self.max_action,
-                    device=self.device,
-                    hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                    unbounded=False,
-                ).to(self.device)
-            critic = NeuralCDECritic(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
-                device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                target='v'
-            ).to(self.device)
-        else:
-            raise NotImplementedError("Unimplemented network: " + net_type)
-        return actor, critic
-  
-    def construct_env(self):
-        env, train_envs, test_envs = make_env(
-            self.task, self.seed, self.training_num, self.test_num,
-            obs_norm=True, state_with_time=self.state_with_time
-        )
-        self.state_shape = env.observation_space.shape or env.observation_space.n
-        self.action_shape = env.action_space.shape or env.action_space.n
-        self.max_action = env.action_space.high[0]
-        print("Observations shape:", self.state_shape)
-        print("Actions shape:", self.action_shape)
-        print("Action range:", np.min(env.action_space.low), np.max(env.action_space.high))
-        # seed
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        return env, train_envs, test_envs
+                t_curr = batch.obs[:, 0]
+                t_next = batch.obs_next[:, 0]
+            batch.timesteps = t_next - t_curr
+        batch = self._compute_returns(batch, buffer, indices)
+        batch.act = to_torch_as(batch.act, batch.v_s)
+        with torch.no_grad():
+            batch.logp_old = self(batch).dist.log_prob(batch.act)
+        return batch
 
-    def construct_collecter(self, stack_num):
-        # collector
-        if self.training_num > 1:
-            buffer = VectorReplayBuffer(self.buffer_size, len(self.train_envs), stack_num=stack_num)
-        else:
-            buffer = ReplayBuffer(self.buffer_size, stack_num=stack_num)
-        train_collector = Collector(self.policy, self.train_envs, buffer, exploration_noise=True)
-        test_collector = Collector(self.policy, self.test_envs)
-        return train_collector, test_collector
+    def learn(  # type: ignore
+        self, batch: Batch, batch_size: int, repeat: int, **kwargs: Any
+    ) -> Dict[str, List[float]]:
+        losses, clip_losses, vf_losses, ent_losses = [], [], [], []
+        for step in range(repeat):            
+            if self._recompute_adv and step > 0:
+                batch = self._compute_returns(batch, self._buffer, self._indices)
 
-    def construct_logger(self):
-        now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-        self.algo_name = "ppo"
-        log_name = os.path.join(self.task, self.algo_name, str(self.seed), now)
-        self.log_path = os.path.join(self.logdir, log_name)
-        # logger
-        if self.logger == "wandb":
-            self.logger = WandbLogger(
-                save_interval=1,
-                name=log_name.replace(os.path.sep, "__"),
-                run_id=self.resume_id,
-                config=self,
-                project=self.wandb_project,
-            )
-        writer = SummaryWriter(self.log_path)
-        writer.add_text("args", str(self))
-        if self.logger == "tensorboard":
-            self.logger = TensorboardLogger(writer)
-        else:  # wandb
-            self.logger.load(writer)
-        with open(self.log_path + '/config.yml', 'w') as conf:
-            conf.write(str(self.conf))
+            for minibatch in batch.split(batch_size, merge_last=True):
+                # calculate loss for actor
+                t0 = time.time()
+                dist = self(minibatch).dist
+                if self._norm_adv:
+                    mean, std = minibatch.adv.mean(), minibatch.adv.std()
+                    minibatch.adv = (minibatch.adv -
+                                     mean) / (std + self._eps)  # per-batch norm
+                ratio = (dist.log_prob(minibatch.act) -
+                         minibatch.logp_old).exp().float()
+                ratio = ratio.reshape(ratio.size(0), -1).transpose(0, 1)
+                surr1 = ratio * minibatch.adv
+                surr2 = ratio.clamp(
+                    1.0 - self._eps_clip, 1.0 + self._eps_clip
+                ) * minibatch.adv
+                mr, ma = torch.mean(ratio), torch.mean(minibatch.adv)
+                if torch.abs(mr) > 5 or torch.abs(ma) > 5:
+                    print(mr, dist.log_prob(minibatch.act)[:10], minibatch.logp_old[:10], ma)
+                if self._dual_clip:
+                    clip1 = torch.min(surr1, surr2)
+                    clip2 = torch.max(clip1, self._dual_clip * minibatch.adv)
+                    clip_loss = -torch.where(minibatch.adv < 0, clip2, clip1).mean()
+                else:
+                    clip_loss = -torch.min(surr1, surr2).mean()
+                # calculate loss for critic
+                value = self.critic(minibatch.obs).flatten()
+                if self._value_clip:
+                    v_clip = minibatch.v_s + \
+                        (value - minibatch.v_s).clamp(-self._eps_clip, self._eps_clip)
+                    vf1 = (minibatch.returns - value).pow(2)
+                    vf2 = (minibatch.returns - v_clip).pow(2)
+                    vf_loss = torch.max(vf1, vf2).mean()
+                else:
+                    vf_loss = (minibatch.returns - value).pow(2).mean()
+                # calculate regularization and overall loss
+                ent_loss = dist.entropy().mean()
+                loss = clip_loss + self._weight_vf * vf_loss \
+                    - self._weight_ent * ent_loss
+                self.optim.zero_grad()
+                loss.backward()
+                if self._grad_norm:  # clip large gradient
+                    nn.utils.clip_grad_norm_(
+                        self._actor_critic.parameters(), max_norm=self._grad_norm
+                    )
+                self.optim.step()
+                clip_losses.append(clip_loss.item())
+                vf_losses.append(vf_loss.item())
+                ent_losses.append(ent_loss.item())
+                losses.append(loss.item())
+                t1 = time.time()
 
-    def initialize_params(self):
-        torch.nn.init.constant_(self.actor.sigma_param, -0.5)
-        for m in list(self.actor.modules()) + list(self.critic.modules()):
-            if isinstance(m, torch.nn.Linear):
-                # orthogonal initialization
-                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                torch.nn.init.zeros_(m.bias)
-        # do last policy layer scaling, this will make initial actions have (close to)
-        # 0 mean and std, and will help boost performances,
-        # see https://arxiv.org/abs/2006.05990, Fig.24 for details
-        for m in self.actor.mu.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.zeros_(m.bias)
-                m.weight.data.copy_(0.01 * m.weight.data)
-
-        self.optim = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.lr
-        )
-
-        self.lr_scheduler = None
-        if self.lr_decay:
-            # decay learning rate to 0 linearly
-            max_update_num = np.ceil(
-                self.step_per_epoch / self.step_per_collect
-            ) * self.epoch
-
-            self.lr_scheduler = LambdaLR(
-                self.optim, lr_lambda=lambda epoch: 1 - epoch / max_update_num
-            )
-
-    def resume(self):
-        # load a previous policy
-        if self.resume_path:
-            ckpt = torch.load(self.resume_path, map_location=self.device)
-            self.policy.load_state_dict(ckpt["model"])
-            self.train_envs.set_obs_rms(ckpt["obs_rms"])
-            self.test_envs.set_obs_rms(ckpt["obs_rms"])
-            print("Loaded agent from: ", self.resume_path)
-    
-    def save_best_fn(self, policy):
-        state = {"model": policy.state_dict(), "obs_rms": self.train_envs.get_obs_rms()}
-        torch.save(state, os.path.join(self.log_path, "policy.pth"))
-
-    def train(self):
-        result = onpolicy_trainer(
-            self.policy,
-            self.train_collector,
-            self.test_collector,
-            self.epoch,
-            self.step_per_epoch,
-            self.repeat_per_collect,
-            self.test_num,
-            self.batch_size,
-            step_per_collect=self.step_per_collect,
-            save_best_fn=self.save_best_fn,
-            logger=self.logger,
-            test_in_train=False,
-        )
-        pprint.pprint(result)
-        return result
-
-    def eval(self):
-        # Let's watch its performance!
-        self.policy.eval()
-        self.test_envs.seed(self.seed)
-        self.test_collector.reset()
-        result = self.test_collector.collect(n_episode=self.test_num, render=self.render)
-        print(f'Final reward: {result["rews"].mean()}, length: {result["lens"].mean()}')
-        return result
-
-
-if __name__ == "__main__":
-    runner = Runner(sys.argv[1])
-    runner.train()
-    runner.eval()
-    # test_ppo()
+        return {
+            "loss": losses,
+            "loss/clip": clip_losses,
+            "loss/vf": vf_losses,
+            "loss/ent": ent_losses,
+        }

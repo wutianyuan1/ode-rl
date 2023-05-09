@@ -1,22 +1,78 @@
-from typing import Any, Dict, Optional, Sequence, Tuple, Type, Union
-
+import torch.nn as nn
 import numpy as np
 import torch
-from torch import nn
+from typing import Any, Dict, Optional, Sequence, Tuple, Type, Union
+from models.s4.s4 import S4Block as S4
+from models.s4.s4d import S4D
+
 
 SIGMA_MIN = -20
 SIGMA_MAX = 2
 
 
-class RecurrentActorProb(nn.Module):
-    """Recurrent version of ActorProb.
+class S4Model(nn.Module):
+    def __init__(self, d_input, d_output=10, d_model=256, n_layers=4, dropout=0.2, lr=0.001, prenorm=False, use_s4d=True):
+        super().__init__()
+        self.prenorm = prenorm
+        # Linear encoder (d_input = 17 for walker)
+        self.encoder = nn.Linear(d_input, d_model)
 
-    For advanced usage (how to customize the network), please refer to
-    :ref:`build_the_network`.
-    """
+        # Stack S4 layers as residual blocks
+        self.s4_layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+        for _ in range(n_layers):
+            if use_s4d:
+                self.s4_layers.append(S4D(d_model, dropout=dropout, transposed=True, lr=min(0.001, lr)))
+            else:
+                self.s4_layers.append(S4(d_model, dropout=dropout, transposed=True, lr=min(0.001, lr)))
+            self.norms.append(nn.LayerNorm(d_model))
+            self.dropouts.append(nn.Dropout1d(dropout))
 
+        # Linear decoder
+        self.decoder = nn.Linear(d_model, d_output)
+
+    def forward(self, x, times=None):
+        """
+        Input x is shape (B, L, d_input)
+        """
+        x = self.encoder(x)  # (B, L, d_input) -> (B, L, d_model)
+        x = x.transpose(-1, -2)  # (B, L, d_model) -> (B, d_model, L)
+        for layer, norm, dropout in zip(self.s4_layers, self.norms, self.dropouts):
+            # Each iteration of this loop will map (B, d_model, L) -> (B, d_model, L)
+
+            z = x
+            if self.prenorm:
+                # Prenorm
+                z = norm(z.transpose(-1, -2)).transpose(-1, -2)
+            # Apply S4 block: we ignore the state input and output
+            z, _ = layer(z)
+            # Dropout on the output of the S4 block
+            z = dropout(z)
+            # Residual connection
+            x = z + x
+            if not self.prenorm:
+                # Postnorm
+                x = norm(x.transpose(-1, -2)).transpose(-1, -2)
+        x = x.transpose(-1, -2)
+        # # Pooling: average pooling over the sequence length
+        # x = x.mean(dim=1)
+        # Decode the outputs
+        x = self.decoder(x)  # (B, d_model) -> (B, d_output)
+        return x
+
+    def param_count(self):
+        params = 0
+        for param in self.parameters():
+            params += np.prod(param.shape)
+        return params
+
+
+
+class S4ActorProb(nn.Module):
     def __init__(
         self,
+        preprocess_net: nn.Module,
         layer_num: int,
         state_shape: Sequence[int],
         action_shape: Sequence[int],
@@ -27,14 +83,9 @@ class RecurrentActorProb(nn.Module):
         conditioned_sigma: bool = False,
     ) -> None:
         super().__init__()
-        print(hidden_layer_size )
         self.device = device
-        self.nn = nn.LSTM(
-            input_size=int(np.prod(state_shape)),
-            hidden_size=hidden_layer_size,
-            num_layers=layer_num,
-            batch_first=True,
-        )
+        self.preprocess = preprocess_net
+        self.s4model = S4Model(hidden_layer_size, hidden_layer_size, dropout=0.2, lr=1e-4)
         output_dim = int(np.prod(action_shape))
         self.mu = nn.Linear(hidden_layer_size, output_dim)
         self._c_sigma = conditioned_sigma
@@ -44,7 +95,6 @@ class RecurrentActorProb(nn.Module):
             self.sigma_param = nn.Parameter(torch.zeros(output_dim, 1))
         self._max = max_action
         self._unbounded = unbounded
-        self.ii = 0
 
     def forward(
         self,
@@ -70,8 +120,10 @@ class RecurrentActorProb(nn.Module):
             # we store the stack data in [bsz, len, ...] format
             # but pytorch rnn needs [len, bsz, ...]
             obs, (hidden, cell) = self.nn(
-                obs, (state["hidden"].transpose(0, 1).contiguous(),
-                      state["cell"].transpose(0, 1).contiguous())
+                obs, (
+                    state["hidden"].transpose(0, 1).contiguous(),
+                    state["cell"].transpose(0, 1).contiguous()
+                )
             )
         logits = obs[:, -1]
         mu = self.mu(logits)
@@ -90,7 +142,7 @@ class RecurrentActorProb(nn.Module):
         }
 
 
-class RecurrentCritic(nn.Module):
+class S4Critic(nn.Module):
     """Recurrent version of Critic.
 
     For advanced usage (how to customize the network), please refer to
@@ -99,30 +151,21 @@ class RecurrentCritic(nn.Module):
 
     def __init__(
         self,
+        preprocess_net: nn.Module,
         layer_num: int,
         state_shape: Sequence[int],
         action_shape: Sequence[int] = [0],
         device: Union[str, int, torch.device] = "cpu",
         hidden_layer_size: int = 128,
-        target: str = 'v'
     ) -> None:
         super().__init__()
         self.state_shape = state_shape
         self.action_shape = action_shape
         self.device = device
-        self.nn = nn.LSTM(
-            input_size=int(np.prod(state_shape)),
-            hidden_size=hidden_layer_size,
-            num_layers=layer_num,
-            batch_first=True,
-        )
-        if target == 'v':
-            self.fc2 = nn.Linear(hidden_layer_size, 1)
-        elif target == 'q':
-            self.fc2 = nn.Linear(hidden_layer_size + int(np.prod(action_shape)), 1)
-        else:
-            print("only V(s) or Q(s, a) is accepted")
-            raise NotImplementedError
+        self.preprocess = preprocess_net
+        print("hidden:", hidden_layer_size)
+        self.s4model = S4Model(hidden_layer_size, hidden_layer_size, n_layers=layer_num, dropout=0.2, lr=1e-4)
+        self.fc2 = nn.Linear(hidden_layer_size, 1)
 
     def forward(
         self,
@@ -140,9 +183,9 @@ class RecurrentCritic(nn.Module):
         # In short, the tensor's shape in training phase is longer than which
         # in evaluation phase.
         assert len(obs.shape) == 3
-        self.nn.flatten_parameters()
-        obs, (hidden, cell) = self.nn(obs)
-        obs = obs[:, -1]
+        obs = self.preprocess(obs)
+        obs = self.s4model(obs)
+        obs = obs[:, -1, :]
         if act is not None:
             act = torch.as_tensor(
                 act,

@@ -57,12 +57,6 @@ class NeuralCDE(nn.Module):
         elif (prev_states is not None) and (input_x.shape[-2] == 1):
             ## evaluation phase, cat input and prev states together
             input_x = torch.cat([prev_states, input_x], dim=-2)
-        elif (prev_states is None) and (input_x.shape[-2] != 1):
-            ## prev_states is None, time dim != 1 --> training phase
-            pass
-        else:
-            ## (prev_states is not None) but (input_x.shape[-2] != 1)
-            raise "NMSL??? why???"
         coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(input_x)
         if self.interpolation == 'cubic':
             X = torchcde.CubicSpline(coeffs)
