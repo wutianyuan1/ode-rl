@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from envs.make_env import make_env
 from torch import nn
+import torch.optim as optim
 from torch.distributions import Independent, Normal
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
@@ -176,6 +177,45 @@ class Runner(object):
         with open(self.log_path + '/config.yml', 'w') as conf:
             conf.write(str(self.conf))
 
+    def setup_optimizer(self, actor, critic):
+        # All parameters in the model
+        all_names = set()
+        all_parameters = []
+        for (name, param) in actor.named_parameters():
+            if name not in all_names:
+                all_names.add(name)
+                all_parameters.append(param)
+        for (name, param) in critic.named_parameters():
+            if name not in all_names:
+                all_names.add(name)
+                all_parameters.append(param)
+
+        # General parameters don't contain the special _optim key
+        params = [p for p in all_parameters if not hasattr(p, "_optim")]
+
+        # Create an optimizer with the general parameters
+        optimizer = optim.AdamW(params, lr=self.lr, weight_decay=0.01)
+
+        # Add parameters with special hyperparameters
+        hps = [getattr(p, "_optim") for p in all_parameters if hasattr(p, "_optim")]
+        hps = [
+            dict(s) for s in sorted(list(dict.fromkeys(frozenset(hp.items()) for hp in hps)))
+        ]  # Unique dicts
+        for hp in hps:
+            params = [p for p in all_parameters if getattr(p, "_optim", None) == hp]
+            optimizer.add_param_group(
+                {"params": params, **hp}
+            )
+        # Print optimizer info
+        keys = sorted(set([k for hp in hps for k in hp.keys()]))
+        for i, g in enumerate(optimizer.param_groups):
+            group_hps = {k: g.get(k, None) for k in keys}
+            print(' | '.join([
+                f"Optimizer group {i}",
+                f"{len(g['params'])} tensors",
+            ] + [f"{k} {v}" for k, v in group_hps.items()]))
+        return optimizer
+
     def initialize_params(self):
         torch.nn.init.constant_(self.actor.sigma_param, -0.5)
         for m in list(self.actor.modules()) + list(self.critic.modules()):
@@ -191,9 +231,7 @@ class Runner(object):
                 torch.nn.init.zeros_(m.bias)
                 m.weight.data.copy_(0.01 * m.weight.data)
 
-        self.optim = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.lr
-        )
+        self.optim = self.setup_optimizer(self.actor, self.critic)
 
         self.lr_scheduler = None
         if self.lr_decay:

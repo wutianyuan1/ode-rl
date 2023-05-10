@@ -32,6 +32,5 @@ logger: 'tensorboard'
 watch: False
 wandb_project: "mujoco.benchmark"
 resume_path: Null
-net_type: 'MLP'
-has_tanh: True
-both_ode: False
+actor_type: 'MLP'
+critic_type: 'MLP'
