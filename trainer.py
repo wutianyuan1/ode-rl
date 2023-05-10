@@ -179,15 +179,9 @@ class Runner(object):
 
     def setup_optimizer(self, actor, critic):
         # All parameters in the model
-        all_names = set()
-        all_parameters = []
-        for (name, param) in actor.named_parameters():
-            if name not in all_names:
-                all_names.add(name)
-                all_parameters.append(param)
+        all_parameters = list(actor.parameters())
         for (name, param) in critic.named_parameters():
-            if name not in all_names:
-                all_names.add(name)
+            if 'preprocess' not in name:
                 all_parameters.append(param)
 
         # General parameters don't contain the special _optim key
