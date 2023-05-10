@@ -3,8 +3,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Type, Union
 import numpy as np
 import torch
 from torch import nn
-from models.neuralcde import NeuralCDE
-from tianshou.utils.net.common import MLP
+from models.neuralcde.neuralcde import NeuralCDE
+from models.recurrent_base import RecurrentActorProb, RecurrentCritic
 
 SIGMA_MIN = -20
 SIGMA_MAX = 2
@@ -19,6 +19,7 @@ class NeuralCDEActorProb(nn.Module):
 
     def __init__(
         self,
+        preprocess: nn.Module,
         layer_num: int,
         state_shape: Sequence[int],
         action_shape: Sequence[int],
@@ -30,8 +31,9 @@ class NeuralCDEActorProb(nn.Module):
     ) -> None:
         super().__init__()
         self.device = device
+        self.preprocess = preprocess
         self.nn = NeuralCDE(
-            input_channels=int(np.prod(state_shape)),
+            input_channels=hidden_layer_size,
             hidden_channels=hidden_layer_size
         )
         output_dim = int(np.prod(action_shape))
@@ -62,7 +64,7 @@ class NeuralCDEActorProb(nn.Module):
         # in evaluation phase.
         if len(obs.shape) == 2:
             obs = obs.unsqueeze(-2)
-
+        obs = self.preprocess(obs)
         orig_obs = obs.detach()
 
         if state is None:
@@ -97,65 +99,20 @@ class NeuralCDEActorProb(nn.Module):
         }
 
 
-class NeuralCDECritic(nn.Module):
-    """Recurrent version of Critic.
-
-    For advanced usage (how to customize the network), please refer to
-    :ref:`build_the_network`.
-    """
-
+class NeuralCDECritic(RecurrentCritic):
     def __init__(
         self,
+        preprocess_net: nn.Module,
         layer_num: int,
         state_shape: Sequence[int],
         action_shape: Sequence[int] = [0],
         device: Union[str, int, torch.device] = "cpu",
         hidden_layer_size: int = 128,
-        target: str = 'v'
     ) -> None:
-        super().__init__()
-        self.state_shape = state_shape
-        self.action_shape = action_shape
-        self.device = device
-        self.nn = NeuralCDE(
-            input_channels=int(np.prod(state_shape)),
-            hidden_channels=hidden_layer_size
-        )
-        self.tanh = nn.Tanh()
-        if target == 'v':
-            self.fc2 = nn.Linear(hidden_layer_size, 1)
-        elif target == 'q':
-            self.fc2 = nn.Linear(hidden_layer_size + int(np.prod(action_shape)), 1)
-        else:
-            print("only V(s) or Q(s, a) is accepted")
-            raise NotImplementedError
+        super().__init__(preprocess_net, 
+                         NeuralCDE(hidden_layer_size, hidden_layer_size),
+                         state_shape, action_shape, device, hidden_layer_size)
 
-    def forward(
-        self,
-        obs: Union[np.ndarray, torch.Tensor],
-        act: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        info: Dict[str, Any] = {},
-    ) -> torch.Tensor:
-        """Almost the same as :class:`~tianshou.utils.net.common.Recurrent`."""
-        obs = torch.as_tensor(
-            obs,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # obs [bsz, len, dim] (training) or [bsz, dim] (evaluation)
-        # In short, the tensor's shape in training phase is longer than which
-        # in evaluation phase.
-        assert len(obs.shape) == 3
-        obs, hidden = self.nn(obs)
-        if act is not None:
-            act = torch.as_tensor(
-                act,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            obs = torch.cat([obs, act], dim=1)
-        obs = self.tanh(obs)
-        obs = self.fc2(obs)
-        return obs
-
-
+    def forward(self, obs, act=None, info={}):
+        info.update({'tanh': True})
+        return super().forward(obs, act, info)

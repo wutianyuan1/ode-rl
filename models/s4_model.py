@@ -1,9 +1,10 @@
 import torch.nn as nn
 import numpy as np
 import torch
-from typing import Any, Dict, Optional, Sequence, Tuple, Type, Union
 from models.s4.s4 import S4Block as S4
 from models.s4.s4d import S4D
+from models.recurrent_base import RecurrentActorProb, RecurrentCritic
+from typing import Sequence, Union, Optional, Dict, Any, Tuple
 
 
 SIGMA_MIN = -20
@@ -68,8 +69,7 @@ class S4Model(nn.Module):
         return params
 
 
-
-class S4ActorProb(nn.Module):
+class S4ActorProb(RecurrentActorProb):
     def __init__(
         self,
         preprocess_net: nn.Module,
@@ -82,19 +82,10 @@ class S4ActorProb(nn.Module):
         unbounded: bool = False,
         conditioned_sigma: bool = False,
     ) -> None:
-        super().__init__()
-        self.device = device
-        self.preprocess = preprocess_net
-        self.s4model = S4Model(hidden_layer_size, hidden_layer_size, dropout=0.2, lr=1e-4)
-        output_dim = int(np.prod(action_shape))
-        self.mu = nn.Linear(hidden_layer_size, output_dim)
-        self._c_sigma = conditioned_sigma
-        if conditioned_sigma:
-            self.sigma = nn.Linear(hidden_layer_size, output_dim)
-        else:
-            self.sigma_param = nn.Parameter(torch.zeros(output_dim, 1))
-        self._max = max_action
-        self._unbounded = unbounded
+        super().__init__(preprocess_net,
+                         S4(hidden_layer_size, dropout=0.2, lr=1e-4, transposed=False).to(device), 
+                         action_shape, hidden_layer_size, max_action, device, unbounded, conditioned_sigma)
+        self.recurrent_model.setup_step()
 
     def forward(
         self,
@@ -111,21 +102,20 @@ class S4ActorProb(nn.Module):
         # obs [bsz, len, dim] (training) or [bsz, dim] (evaluation)
         # In short, the tensor's shape in training phase is longer than which
         # in evaluation phase.
+        obs = self.preprocess(obs)
         if len(obs.shape) == 2:
             obs = obs.unsqueeze(-2)
-        self.nn.flatten_parameters()
         if state is None:
-            obs, (hidden, cell) = self.nn(obs)
+            hidden = self.recurrent_model.default_state(obs.shape[0])
+            obs, state = self.recurrent_model(obs)
         else:
             # we store the stack data in [bsz, len, ...] format
             # but pytorch rnn needs [len, bsz, ...]
-            obs, (hidden, cell) = self.nn(
-                obs, (
-                    state["hidden"].transpose(0, 1).contiguous(),
-                    state["cell"].transpose(0, 1).contiguous()
-                )
-            )
-        logits = obs[:, -1]
+            obs, hidden = self.recurrent_model.step(obs.squeeze(-2), state["hidden"])
+        if len(obs.shape) == 3:
+            logits = obs[:, -1]
+        else:
+            logits = obs
         mu = self.mu(logits)
         if not self._unbounded:
             mu = self._max * torch.tanh(mu)
@@ -136,19 +126,10 @@ class S4ActorProb(nn.Module):
             shape[1] = -1
             sigma = (self.sigma_param.view(shape) + torch.zeros_like(mu)).exp()
         # please ensure the first dim is batch size: [bsz, len, ...]
-        return (mu, sigma), {
-            "hidden": hidden.transpose(0, 1).detach(),
-            "cell": cell.transpose(0, 1).detach()
-        }
+        return (mu, sigma), {"hidden": hidden}
 
 
-class S4Critic(nn.Module):
-    """Recurrent version of Critic.
-
-    For advanced usage (how to customize the network), please refer to
-    :ref:`build_the_network`.
-    """
-
+class S4Critic(RecurrentCritic):
     def __init__(
         self,
         preprocess_net: nn.Module,
@@ -158,40 +139,6 @@ class S4Critic(nn.Module):
         device: Union[str, int, torch.device] = "cpu",
         hidden_layer_size: int = 128,
     ) -> None:
-        super().__init__()
-        self.state_shape = state_shape
-        self.action_shape = action_shape
-        self.device = device
-        self.preprocess = preprocess_net
-        print("hidden:", hidden_layer_size)
-        self.s4model = S4Model(hidden_layer_size, hidden_layer_size, n_layers=layer_num, dropout=0.2, lr=1e-4)
-        self.fc2 = nn.Linear(hidden_layer_size, 1)
-
-    def forward(
-        self,
-        obs: Union[np.ndarray, torch.Tensor],
-        act: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        info: Dict[str, Any] = {},
-    ) -> torch.Tensor:
-        """Almost the same as :class:`~tianshou.utils.net.common.Recurrent`."""
-        obs = torch.as_tensor(
-            obs,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        # obs [bsz, len, dim] (training) or [bsz, dim] (evaluation)
-        # In short, the tensor's shape in training phase is longer than which
-        # in evaluation phase.
-        assert len(obs.shape) == 3
-        obs = self.preprocess(obs)
-        obs = self.s4model(obs)
-        obs = obs[:, -1, :]
-        if act is not None:
-            act = torch.as_tensor(
-                act,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            obs = torch.cat([obs, act], dim=1)
-        obs = self.fc2(obs)
-        return obs
+        super().__init__(preprocess_net,
+                         S4Model(hidden_layer_size, hidden_layer_size, n_layers=layer_num, dropout=0.2, lr=1e-4).to(device),
+                         state_shape, action_shape, device, hidden_layer_size)

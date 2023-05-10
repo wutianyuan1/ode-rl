@@ -19,12 +19,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
 from tianshou.trainer import onpolicy_trainer
 from tianshou.utils import TensorboardLogger, WandbLogger
-from tianshou.utils.net.common import Net, MLP
-from tianshou.utils.net.continuous import ActorProb, Critic
-from models.rnn_model import RecurrentActorProb, RecurrentCritic
+from models.rnn_model import GRUActorProb, GRUCritic, LSTMActorProb, LSTMCritic
 from models.cde_model import NeuralCDEActorProb, NeuralCDECritic
 from models.s4_model import S4ActorProb, S4Critic
-from models.mlp_model import MLPActorProb
+from models.mlp_model import MLPActorProb, MLPCritic
 from models.representation import RepresentationMLP
 from ppo import PPOPolicy
 
@@ -45,7 +43,7 @@ class Runner(object):
         print(self.__dict__)
         self.conf = conf
         self.env, self.train_envs, self.test_envs = self.construct_env()
-        self.actor, self.critic = self.construct_net(self.net_type)
+        self.actor, self.critic = self.construct_net(self.actor_type, self.critic_type)
         self.initialize_params()
         self.policy = PPOPolicy(
             self.actor,
@@ -70,93 +68,71 @@ class Runner(object):
             recompute_advantage=self.recompute_adv,
         )
         self.resume()
+        no_recurrence = (self.actor_type == 'MLP' and self.critic_type == 'MLP')
         self.train_collector, self.test_collector = self.construct_collecter(
-            stack_num=1 if self.net_type == 'MLP' else self.history_len)
+            stack_num=1 if no_recurrence else self.history_len)
         self.construct_logger()
         
-    def construct_net(self, net_type):
-        if net_type == 'MLP':
-            net_a = Net(
-                self.state_shape,
-                hidden_sizes=self.hidden_sizes,
-                activation=nn.Tanh,
-                device=self.device,
-            )
-            actor = ActorProb(
-                net_a,
+    def construct_net(self, actor_type, critic_type):
+        print("state:", self.state_shape, "hiddens:", self.hidden_sizes)
+        preprocess = RepresentationMLP(np.prod(self.state_shape), self.hidden_sizes, nn.Tanh, device=self.device).to(self.device)
+        ## Construct Actor !!
+        if actor_type == 'MLP':
+            actor = MLPActorProb(
+                preprocess,
                 self.action_shape,
                 max_action=self.max_action,
                 unbounded=True,
                 device=self.device,
             ).to(self.device)
-            net_c = Net(
-                self.state_shape,
-                hidden_sizes=self.hidden_sizes,
-                activation=nn.Tanh,
-                device=self.device,
-            )
-            critic = Critic(net_c, device=self.device).to(self.device)
-        elif net_type == 'RNN':
-            actor = RecurrentActorProb(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
+        elif actor_type == 'GRU':
+            actor = GRUActorProb(
+                preprocess, 4, self.state_shape, self.action_shape,
                 max_action=self.max_action,
                 device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
+                hidden_layer_size=self.hidden_sizes[-1],
                 unbounded=True,
             ).to(self.device)
-            critic = RecurrentCritic(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
+        elif actor_type == 'LSTM':
+            actor = LSTMActorProb(
+                preprocess, 4, self.state_shape, self.action_shape,
+                max_action=self.max_action,
                 device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                target='v'
+                hidden_layer_size=self.hidden_sizes[-1],
+                unbounded=True,
             ).to(self.device)
-        elif net_type == 'S4':
-            print("state:", self.state_shape, "hiddens:", self.hidden_sizes)
-            preprocess = RepresentationMLP(np.prod(self.state_shape), self.hidden_sizes, nn.Tanh, device=self.device).to(self.device)
-            # preprocess = Net(self.state_shape, hidden_sizes=self.hidden_sizes, activation=nn.Tanh, device=self.device)
-            # print("linear:", np.prod(self.state_shape), self.hidden_sizes[-1])
-            # preprocess = nn.Linear(np.prod(self.state_shape), self.hidden_sizes[-1], device=self.device).to(self.device)
-            actor = MLPActorProb(preprocess, self.action_shape, max_action=self.max_action, unbounded=True, device=self.device).to(self.device)
-            critic = S4Critic(preprocess, layer_num=4, state_shape=self.state_shape, action_shape=self.action_shape, device=self.device, hidden_layer_size=self.hidden_sizes[-1]).to(self.device)
-        elif net_type == 'CDE':
-            if not self.both_ode:
-                net_a = Net(
-                    self.state_shape,
-                    hidden_sizes=self.hidden_sizes,
-                    activation=nn.Tanh,
-                    device=self.device,
-                )
-                actor = MLPActorProb(
-                    net_a,
-                    self.action_shape,
-                    max_action=self.max_action,
-                    unbounded=True,
-                    device=self.device,
-                ).to(self.device)
-            else:
-                actor = NeuralCDEActorProb(
-                    layer_num=3,
-                    state_shape=self.state_shape,
-                    action_shape=self.action_shape,
-                    max_action=self.max_action,
-                    device=self.device,
-                    hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                    unbounded=False,
-                ).to(self.device)
-            critic = NeuralCDECritic(
-                layer_num=3,
-                state_shape=self.state_shape,
-                action_shape=self.action_shape,
+        elif actor_type == 'S4':
+            actor = S4ActorProb(
+                preprocess, 4, self.state_shape, self.action_shape,
+                max_action=self.max_action,
                 device=self.device,
-                hidden_layer_size=int(np.mean(self.hidden_sizes)),
-                target='v'
+                hidden_layer_size=self.hidden_sizes[-1],
+                unbounded=True,
+            ).to(self.device)
+        elif actor_type == 'CDE':
+            actor = NeuralCDEActorProb(
+                preprocess, 4, self.state_shape, self.action_shape,
+                max_action=self.max_action,
+                device=self.device,
+                hidden_layer_size=self.hidden_sizes[-1],
+                unbounded=True,
             ).to(self.device)
         else:
-            raise NotImplementedError("Unimplemented network: " + net_type)
+            raise NotImplementedError("Unimplemented actor: " + actor_type)
+
+        ## Construct Critic !!
+        if critic_type == 'MLP':
+            critic = MLPCritic(preprocess, device=self.device).to(self.device)
+        elif critic_type == 'S4':
+            critic = S4Critic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
+        elif critic_type == 'GRU':
+            critic = GRUCritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
+        elif critic_type == 'LSTM':
+            critic = LSTMCritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
+        elif critic_type == 'CDE':
+            critic = NeuralCDECritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
+        else:
+            raise NotImplementedError("Unimplemented critic: " + actor_type)
         return actor, critic
   
     def construct_env(self):
@@ -275,4 +251,3 @@ if __name__ == "__main__":
     runner = Runner(sys.argv[1])
     runner.train()
     runner.eval()
-    # test_ppo()

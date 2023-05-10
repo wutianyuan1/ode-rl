@@ -113,6 +113,6 @@ class MLPCritic(nn.Module):
                 dtype=torch.float32,
             ).flatten(1)
             obs = torch.cat([obs, act], dim=1)
-        logits, hidden = self.preprocess(obs)
+        logits = self.preprocess(obs)
         logits = self.last(logits)
         return logits
