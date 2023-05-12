@@ -42,7 +42,7 @@ class Runner(object):
         # Add config attributes to self
         for key, value in conf.items():
             self.__dict__[key] = value
-        print(self.__dict__)
+        # print(self.__dict__)
         self.conf = conf
         self.env, self.train_envs, self.test_envs = self.construct_env()
         self.actor, self.critic = self.construct_net(self.actor_type, self.critic_type)
@@ -73,7 +73,7 @@ class Runner(object):
         no_recurrence = (self.actor_type == 'MLP' and self.critic_type == 'MLP')
         self.train_collector, self.test_collector = self.construct_collecter(
             stack_num=1 if no_recurrence else self.history_len)
-        self.construct_logger()
+        self.construct_logger(self.expr_id)
         
     def construct_net(self, actor_type, critic_type):
         print("state:", self.state_shape, "hiddens:", self.hidden_sizes)
@@ -165,8 +165,8 @@ class Runner(object):
         test_collector = Collector(self.policy, self.test_envs)
         return train_collector, test_collector
 
-    def construct_logger(self):
-        now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+    def construct_logger(self, expr_id):
+        now = datetime.datetime.now().strftime("%y%m%d-%H%M%S") + str(expr_id)
         self.algo_name = "ppo"
         log_name = os.path.join(self.task, self.algo_name, str(self.seed), now)
         self.log_path = os.path.join(self.logdir, log_name)
