@@ -22,6 +22,7 @@ from tianshou.trainer import onpolicy_trainer
 from tianshou.utils import TensorboardLogger, WandbLogger
 from models.rnn_model import GRUActorProb, GRUCritic, LSTMActorProb, LSTMCritic
 from models.cde_model import NeuralCDEActorProb, NeuralCDECritic
+from models.hbode_model import HBOdeCritic
 from models.s4_model import S4ActorProb, S4Critic
 from models.mlp_model import MLPActorProb, MLPCritic
 from models.representation import RepresentationMLP
@@ -132,6 +133,8 @@ class Runner(object):
             critic = LSTMCritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
         elif critic_type == 'CDE':
             critic = NeuralCDECritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
+        elif critic_type == 'HBODE':
+            critic = HBOdeCritic(preprocess, 4, self.state_shape, self.action_shape, self.device, self.hidden_sizes[-1]).to(self.device)
         else:
             raise NotImplementedError("Unimplemented critic: " + actor_type)
         return actor, critic
