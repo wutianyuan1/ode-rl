@@ -9,7 +9,7 @@ step_per_epoch: 30000
 step_per_collect: 2048
 repeat_per_collect: 10
 batch_size: 64
-training_num: 64
+training_num: 16
 test_num: 10
 rew_norm: True
 state_with_time: True
@@ -27,10 +27,11 @@ recompute_adv: 1
 history_len: 8
 logdir: 'log'
 render: 0.0
-device: 'cuda'
+device: 'cpu'
 logger: 'tensorboard'
 watch: False
 wandb_project: "mujoco.benchmark"
 resume_path: Null
 actor_type: 'MLP'
 critic_type: 'MLP'
+expr_id: 12345

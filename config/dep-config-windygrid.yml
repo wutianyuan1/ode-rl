@@ -17,7 +17,7 @@ training_num: 32
 test_num: 10
 logdir: log
 render: 0.
-device: "cuda"
+device: "cpu"
 history_len: 8
 logger: tensorboard
 wandb_project: atari.benchmark
@@ -27,3 +27,4 @@ mlp_hidden_size: [256, 512]
 cde_hidden_size: 64
 resume_path: Null
 resume_id: Null
+expr_id: 12345

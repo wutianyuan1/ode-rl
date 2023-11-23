@@ -283,6 +283,7 @@ class Runner(object):
 
 
 if __name__ == "__main__":
+    torch.set_num_threads(4)
     runner = Runner(sys.argv[1])
     runner.train()
     runner.eval()
